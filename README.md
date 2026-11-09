@@ -1,11 +1,11 @@
-# X-WALL
+# D-WALL
 
 Check a QR code or payment link for signs of a scam before you pay.
 
 ## ABOUT
 
 Payment scams in India often arrive as a QR code or a *UPI* link: "scan to get your refund",
-"claim your cashback". X-WALL takes the QR image or the link, works out where it really leads, and
+"claim your cashback". D-WALL takes the QR image or the link, works out where it really leads, and
 gives it a score from 0 to 100 with a plain list of reasons, so you can decide before you pay.
 
 It's a *prototype*. Some checks are real and some are still *placeholders* (see Status).
@@ -68,7 +68,7 @@ Each rule that matches adds points and a reason. The total decides the *verdict*
 ## GETTING STARTED
 
 You need Python 3.10+ and Node.js 20+. QR decoding with pyzbar also needs the zbar library
-(`sudo apt install libzbar0` on Debian/Ubuntu, `brew install zbar` on macOS). Without it, X-WALL
+(`sudo apt install libzbar0` on Debian/Ubuntu, `brew install zbar` on macOS). Without it, D-WALL
 falls back to OpenCV.
 
 Backend:
