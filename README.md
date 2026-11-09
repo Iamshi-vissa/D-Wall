@@ -43,8 +43,8 @@ falls back to OpenCV.
 Backend:
 
 ```bash
-git clone https://github.com/Iamshi-vissa/X-WALL.git
-cd X-WALL/backend
+git clone https://github.com/Iamshi-vissa/D-Wall.git
+cd D-Wall/backend
 python -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -61,7 +61,7 @@ playwright install chromium
 Frontend, in a second terminal:
 
 ```bash
-cd X-WALL/frontend
+cd D-Wall/frontend
 npm install
 npm run dev
 ```
