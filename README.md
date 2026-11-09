@@ -1,8 +1,8 @@
-# <img src="docs/headers/h1-x-wall.svg" alt="X-WALL" height="60">
+# X-WALL
 
 Check a QR code or payment link for signs of a scam before you pay.
 
-## <img src="docs/headers/h2-about.svg" alt="ABOUT" height="38">
+## ABOUT
 
 Payment scams in India often arrive as a QR code or a *UPI* link: "scan to get your refund",
 "claim your cashback". X-WALL takes the QR image or the link, works out where it really leads, and
@@ -10,7 +10,7 @@ gives it a score from 0 to 100 with a plain list of reasons, so you can decide b
 
 It's a *prototype*. Some checks are real and some are still *placeholders* (see Status).
 
-## <img src="docs/headers/h2-features.svg" alt="FEATURES" height="38">
+## FEATURES
 
 - Upload a QR code image or paste a link or *UPI* string
 - Follows redirects (up to 5 hops) and shows the full chain, so short links can't hide where they go
@@ -21,7 +21,7 @@ It's a *prototype*. Some checks are real and some are still *placeholders* (see 
 - Optionally opens the page in a *headless browser* to look for password or card forms
 - Result: **Safe** (0–30), **Suspicious** (31–70) or **Dangerous** (71–100), with the reasons
 
-## <img src="docs/headers/h2-how-it-works.svg" alt="HOW IT WORKS" height="38">
+## HOW IT WORKS
 
 1. The QR image is decoded with OpenCV and pyzbar to get the text inside it.
 2. If it's a *UPI* string (`upi://pay?...`), the payee and amount are checked.
@@ -29,7 +29,7 @@ It's a *prototype*. Some checks are real and some are still *placeholders* (see 
    against the rules above.
 4. Each rule that matches adds points and a reason. The total becomes the *verdict*.
 
-## <img src="docs/headers/h2-architecture.svg" alt="ARCHITECTURE" height="38">
+## ARCHITECTURE
 
 ```mermaid
 flowchart TB
@@ -47,7 +47,7 @@ flowchart TB
 
 Each rule that matches adds points and a reason. The total decides the *verdict*.
 
-## <img src="docs/headers/h2-tech-stack.svg" alt="TECH STACK" height="38">
+## TECH STACK
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-000000?style=flat-square&logo=python&logoColor=white" alt="Python">
@@ -65,7 +65,7 @@ Each rule that matches adds points and a reason. The total decides the *verdict*
 | Link checks | requests; Playwright (optional) |
 | Web app | React, Vite |
 
-## <img src="docs/headers/h2-getting-started.svg" alt="GETTING STARTED" height="38">
+## GETTING STARTED
 
 You need Python 3.10+ and Node.js 20+. QR decoding with pyzbar also needs the zbar library
 (`sudo apt install libzbar0` on Debian/Ubuntu, `brew install zbar` on macOS). Without it, X-WALL
@@ -99,7 +99,7 @@ npm run dev
 
 Open the address Vite prints, usually <http://localhost:5173>.
 
-## <img src="docs/headers/h2-api.svg" alt="API" height="38">
+## API
 
 | Endpoint | What it does |
 |---|---|
@@ -107,7 +107,7 @@ Open the address Vite prints, usually <http://localhost:5173>.
 | `POST /analyze/link` | Body `{"input": "<link or UPI string>"}` |
 | `POST /analyze/qr` | Upload a QR image as `file` |
 
-## <img src="docs/headers/h2-project-structure.svg" alt="PROJECT STRUCTURE" height="38">
+## PROJECT STRUCTURE
 
 ```
 backend/main.py     the API and every check
@@ -115,7 +115,7 @@ frontend/src/       the web app that runs today
 frontend/client/    a newer interface, not wired up yet (see Status)
 ```
 
-## <img src="docs/headers/h2-status.svg" alt="STATUS" height="38">
+## STATUS
 
 *Prototype*. Things that need work:
 
@@ -129,6 +129,6 @@ frontend/client/    a newer interface, not wired up yet (see Status)
 - The brand list only covers Indian payment apps (Paytm, PhonePe, Google Pay, BHIM and others).
 - There are no automated tests yet.
 
-## <img src="docs/headers/h2-license.svg" alt="LICENSE" height="38">
+## LICENSE
 
 MIT. See [LICENSE](LICENSE).
