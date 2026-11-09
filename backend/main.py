@@ -3,7 +3,6 @@ X-Wall — Scam QR Code & Payment Link Analyzer
 Backend: FastAPI + OpenCV + pyzbar
 """
 
-import asyncio
 import base64
 import re
 import urllib.parse
@@ -12,7 +11,7 @@ from typing import Optional
 import cv2
 import numpy as np
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
@@ -136,7 +135,7 @@ def extract_domain(url: str) -> str:
     """Return just the hostname (lowercase, no www.)."""
     try:
         host = urllib.parse.urlparse(url).netloc
-        return host.lower().lstrip("www.").split(":")[0]
+        return host.lower().split(":")[0].removeprefix("www.")
     except Exception:
         return ""
 
@@ -174,7 +173,7 @@ def is_shortened_url(url: str) -> bool:
         "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly",
         "short.link", "rb.gy", "buff.ly", "is.gd", "tiny.cc",
         "cutt.ly", "shorturl.at", "tiny.one", "snip.ly",
-        "v.gd", "qr.ae", "shorte.st", "is.gd", "bit.do",
+        "v.gd", "qr.ae", "shorte.st", "bit.do",
     }
     domain = extract_domain(url)
     if domain in shorteners:
@@ -316,10 +315,9 @@ async def analyze(raw: str) -> dict:
         reasons.append(f"Long redirect chain ({hops} hops) — often used to obscure destination.")
     elif hops == 2:
         score += 10
-        reasons.append(f"Two redirect hops found.")
+        reasons.append("Two redirect hops found.")
 
     # Work with the final destination URL from here on
-    url_lower = final_url.lower()
     domain = extract_domain(final_url)
     parsed = urllib.parse.urlparse(final_url)
     full_path = (parsed.path + "?" + parsed.query).lower()
