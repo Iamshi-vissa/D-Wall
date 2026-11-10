@@ -1,9 +1,20 @@
 """
-X-Wall — Scam QR Code & Payment Link Analyzer
-Backend: FastAPI + OpenCV + pyzbar
+D-WALL — Scam QR Code & Payment Link Analyzer
+Backend: FastAPI + OpenCV + pyzbar + a trained phishing-URL model (scikit-learn)
+
+Scoring
+-------
+Every link gets two independent scores (0-100):
+  * ml_score   - the trained model's phishing probability x 100 (see ml/D-WALL_Model_Training.ipynb)
+  * rule_score - D-WALL's expert rules (look-alike brands, redirects, credential forms, ...)
+The final score is the HIGHER of the two: either detector can raise the alarm.
 """
 
+from __future__ import annotations
+
 import base64
+import logging
+import os
 import re
 import urllib.parse
 from typing import Optional
@@ -11,33 +22,33 @@ from typing import Optional
 import cv2
 import numpy as np
 import requests
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 try:
     from pyzbar import pyzbar
     HAS_PYZBAR = True
-except ImportError:
-    HAS_PYZBAR = False
-except Exception:
-    # On Windows, pyzbar often crashes during import due to missing DLLs
+except Exception:  # ImportError, or missing zbar DLL on Windows
     HAS_PYZBAR = False
 
 # Playwright is optional — will gracefully degrade if not available
 try:
     from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
     HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
 except Exception:
     HAS_PLAYWRIGHT = False
 
-app = FastAPI(title="X-Wall API", version="0.1.0")
+from ml.predictor import DEFAULT_MODEL_PATH, PhishingModel
 
-# Allow the Vite dev server to talk to us
+log = logging.getLogger("dwall")
+
+app = FastAPI(title="D-WALL API", version="2.0.0")
+
+_origins = os.getenv("DWALL_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[o.strip() for o in _origins.split(",") if o.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -57,14 +68,22 @@ SUSPICIOUS_KEYWORDS = [
     "update", "suspended", "blocked", "expire", "alert",
 ]
 
+SHORTENERS = {
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly",
+    "short.link", "rb.gy", "buff.ly", "is.gd", "tiny.cc",
+    "cutt.ly", "shorturl.at", "tiny.one", "snip.ly",
+    "v.gd", "qr.ae", "shorte.st", "bit.do", "rebrand.ly", "t.ly",
+}
+
 MAX_REDIRECT_HOPS = 5
 REQUEST_TIMEOUT = 5  # seconds
+MAX_INPUT_LEN = 2048
+MAX_BATCH = 1000
+MAX_QR_BYTES = 5 * 1024 * 1024
 
-# Landing page sandbox settings
-SANDBOX_TIMEOUT = 8000  # milliseconds (8s)
+SANDBOX_TIMEOUT = 8000  # milliseconds
 SANDBOX_VIEWPORT = {"width": 1280, "height": 720}
 
-# Selectors for credential harvesting indicators
 CREDENTIAL_SELECTORS = [
     'input[type="password"]',
     'input[name*="pin" i]',
@@ -77,39 +96,35 @@ CREDENTIAL_SELECTORS = [
     'input[type="text"][id*="upi" i]',
     'input[name*="otp" i]',
     'input[id*="otp" i]',
-    'input[name*="m pin" i]',
-    'input[id*="m pin" i]',
     'input[name*="mpin" i]',
     'input[id*="mpin" i]',
 ]
 
+GSB_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
-# STUB: Domain-age lookup
-# In production, replace with WHOIS / DomainTools / SecurityTrails API call.
+# ML model (loaded once at start-up)
 # ---------------------------------------------------------------------------
 
-def stub_domain_age_days(domain: str) -> int:
-    """
-    STUB — returns a fake but plausible domain age.
-    Real implementation: query WHOIS / SecurityTrails and parse creation date.
-    """
-    # Deterministic fake age based on domain length so results are consistent
-    seed = sum(ord(c) for c in domain) % 365
-    return seed + 1  # 1..365 days
+MODEL: Optional[PhishingModel] = None
+MODEL_ERROR: Optional[str] = None
+try:
+    MODEL = PhishingModel.load(os.getenv("DWALL_MODEL_PATH", DEFAULT_MODEL_PATH))
+except Exception as exc:  # missing file, version mismatch, ...
+    MODEL_ERROR = f"{type(exc).__name__}: {exc}"
+    log.warning("ML model not loaded (%s). Falling back to rules only.", MODEL_ERROR)
 
 
 # ---------------------------------------------------------------------------
-# STUB: Threat-feed lookup
-# In production, replace with VirusTotal / Google Safe Browsing / PhishTank.
+# Request models (input validation)
 # ---------------------------------------------------------------------------
 
-def stub_threat_feed(url: str) -> bool:
-    """
-    STUB — always returns False (not on threat feed).
-    Real implementation: hit VirusTotal /urls or Google Safe Browsing API.
-    """
-    return False
+class LinkRequest(BaseModel):
+    input: str = Field(..., min_length=1, max_length=MAX_INPUT_LEN, description="URL or UPI string")
+
+
+class BatchRequest(BaseModel):
+    urls: list[str] = Field(..., min_length=1, max_length=MAX_BATCH)
 
 
 # ---------------------------------------------------------------------------
@@ -134,17 +149,23 @@ def levenshtein(a: str, b: str) -> int:
 def extract_domain(url: str) -> str:
     """Return just the hostname (lowercase, no www.)."""
     try:
-        host = urllib.parse.urlparse(url).netloc
-        return host.lower().split(":")[0].removeprefix("www.")
+        host = urllib.parse.urlparse(url).hostname or ""
+        return host.lower().removeprefix("www.")
     except Exception:
         return ""
 
 
+def ensure_scheme(raw: str) -> Optional[str]:
+    """Add https:// to bare domains. Returns None if it doesn't look like a link."""
+    if raw.lower().startswith(("http://", "https://")):
+        return raw
+    if re.match(r"^[\w.-]+\.[a-zA-Z]{2,}(?::\d+)?(?:[/?#].*)?$", raw) or re.match(r"^\d{1,3}(\.\d{1,3}){3}", raw):
+        return "https://" + raw
+    return None
+
+
 def follow_redirects(url: str) -> list[str]:
-    """
-    Follow up to MAX_REDIRECT_HOPS redirects and return the chain of URLs.
-    Does NOT raise on HTTP errors — captures them for scoring.
-    """
+    """Follow up to MAX_REDIRECT_HOPS redirects and return the chain of URLs."""
     chain = [url]
     session = requests.Session()
     session.max_redirects = MAX_REDIRECT_HOPS
@@ -153,7 +174,7 @@ def follow_redirects(url: str) -> list[str]:
             url,
             allow_redirects=True,
             timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (X-Wall/0.1 security scanner)"},
+            headers={"User-Agent": "Mozilla/5.0 (D-WALL/2.0 security scanner)"},
         )
         for r in resp.history:
             if r.url not in chain:
@@ -168,38 +189,46 @@ def follow_redirects(url: str) -> list[str]:
 
 
 def is_shortened_url(url: str) -> bool:
-    """Check if domain is a known URL shortener."""
-    shorteners = {
-        "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly",
-        "short.link", "rb.gy", "buff.ly", "is.gd", "tiny.cc",
-        "cutt.ly", "shorturl.at", "tiny.one", "snip.ly",
-        "v.gd", "qr.ae", "shorte.st", "bit.do",
-    }
-    domain = extract_domain(url)
-    if domain in shorteners:
-        return True
-    return False
+    return extract_domain(url) in SHORTENERS
 
 
 def parse_upi(raw: str) -> Optional[dict]:
-    """
-    Parse a UPI deep-link (upi://pay?...) and return its parameters.
-    Returns None if the input isn't a UPI string.
-    """
+    """Parse a UPI deep-link (upi://pay?...) and return its parameters."""
     if not raw.lower().startswith("upi://"):
         return None
     parsed = urllib.parse.urlparse(raw)
-    params = dict(urllib.parse.parse_qsl(parsed.query))
-    return params
+    return dict(urllib.parse.parse_qsl(parsed.query))
+
+
+def check_threat_feed(url: str) -> Optional[bool]:
+    """Google Safe Browsing lookup. Returns None when no API key is configured or the call fails."""
+    if not GSB_API_KEY:
+        return None
+    body = {
+        "client": {"clientId": "d-wall", "clientVersion": app.version},
+        "threatInfo": {
+            "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": url}],
+        },
+    }
+    try:
+        r = requests.post(
+            "https://safebrowsing.googleapis.com/v4/threatMatches:find",
+            params={"key": GSB_API_KEY}, json=body, timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        return bool(r.json().get("matches"))
+    except Exception as exc:
+        log.warning("Safe Browsing lookup failed: %s", exc)
+        return None
 
 
 async def run_landing_page_check(url: str) -> dict:
-    """
-    Use Headless Playwright to check for credential harvesting inputs.
-    Returns: { "has_creds": bool, "screenshot_b64": str, "error": str }
-    """
+    """Use headless Playwright to look for password / PIN / OTP fields on the page."""
     if not HAS_PLAYWRIGHT or not url.startswith(("http://", "https://")):
-        return {"has_creds": False, "screenshot_b64": None, "error": "Playwright unavailable or not a web URL"}
+        return {"has_creds": False, "screenshot_b64": None, "error": "Playwright not installed"}
 
     result = {"has_creds": False, "screenshot_b64": None, "error": None}
     try:
@@ -207,222 +236,211 @@ async def run_landing_page_check(url: str) -> dict:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(viewport=SANDBOX_VIEWPORT)
             page = await context.new_page()
-
-            # Navigate with timeout
             try:
                 await page.goto(url, timeout=SANDBOX_TIMEOUT)
             except PlaywrightTimeout:
                 result["error"] = "Timeout"
                 await browser.close()
                 return result
-
-            # Check for credential fields
             for selector in CREDENTIAL_SELECTORS:
                 if await page.query_selector(selector):
                     result["has_creds"] = True
                     break
-
-            # Take screenshot
             screenshot_bytes = await page.screenshot(type="png", full_page=False)
             result["screenshot_b64"] = base64.b64encode(screenshot_bytes).decode("utf-8")
-
             await browser.close()
     except Exception as e:
         result["error"] = str(e)
     return result
 
+
 # ---------------------------------------------------------------------------
-# Scoring engine
+# Scoring
 # ---------------------------------------------------------------------------
 
-async def analyze(raw: str) -> dict:
-    """
-    Core analysis function.  Accepts a raw URL, UPI string, or any text
-    decoded from a QR code.  Returns a structured result dict.
-    """
-    reasons: list[str] = []
-    score = 0
-    redirect_chain: list[str] = [raw]
-    final_url = raw
-    landing_check = {"has_creds": False, "screenshot_b64": None, "error": None}
-
-    # ── UPI path ─────────────────────────────────────────────────────────────
-    upi_params = parse_upi(raw)
-    if upi_params:
-        vpa: str = upi_params.get("pa", "")
-        amount_str: str = upi_params.get("am", "")
-
-        # VPA format check: should be something@bankhandle
-        if vpa and not re.match(r"^[\w.\-]+@[\w]+$", vpa):
-            score += 25
-            reasons.append(f"UPI VPA '{vpa}' has an unusual format — may be fake.")
-
-        # Suspicious amount
-        try:
-            amount = float(amount_str)
-            if amount > 10_000:
-                score += 20
-                reasons.append(f"UPI request is for ₹{amount:,.0f} — unusually high amount.")
-            elif amount > 0:
-                reasons.append(f"UPI amount requested: ₹{amount:,.0f}.")
-        except (ValueError, TypeError):
-            pass
-
-        # Keyword scan on VPA
-        for kw in SUSPICIOUS_KEYWORDS:
-            if kw in vpa.lower():
-                score += 15
-                reasons.append(f"UPI VPA contains suspicious keyword '{kw}'.")
-                break
-
-        return _build_result(score, reasons, redirect_chain, final_url, landing_check)
-
-    # ── URL path ─────────────────────────────────────────────────────────────
-    # Ensure it looks like a URL; prepend https:// if missing so urlparse works
-    if not raw.lower().startswith(("http://", "https://")):
-        if "." in raw:
-            raw = "https://" + raw
-        else:
-            reasons.append("Input doesn't look like a URL or UPI string.")
-            return _build_result(min(score + 10, 100), reasons, redirect_chain, raw, landing_check)
-
-    final_url = raw
-
-    # Follow redirects if shortened
-    if is_shortened_url(raw):
-        redirect_chain = follow_redirects(raw)
-        last_hop = redirect_chain[-1]
-        if last_hop.startswith("<"):
-            # An error occurred during redirection
-            final_url = redirect_chain[-2] if len(redirect_chain) > 1 else raw
-            reasons.append(f"Shortened URL failed to resolve: {last_hop.strip('<>')}")
-        else:
-            final_url = last_hop
-            reasons.append(f"Shortened URL detected — resolves via {len(redirect_chain) - 1} hop(s).")
-
-    # Landing page check (async)
-    landing_check = await run_landing_page_check(final_url)
-    if landing_check["has_creds"]:
-        score += 40
-        reasons.append("Asks for a UPI PIN or password on the page — high credential harvesting risk.")
-    elif landing_check["error"]:
-        reasons.append(f"Landing page check unavailable: {landing_check['error']}.")
-
-    # Redirect chain length penalty
-    hops = len(redirect_chain) - 1
-    if hops >= 3:
-        score += 20
-        reasons.append(f"Long redirect chain ({hops} hops) — often used to obscure destination.")
-    elif hops == 2:
-        score += 10
-        reasons.append("Two redirect hops found.")
-
-    # Work with the final destination URL from here on
-    domain = extract_domain(final_url)
-    parsed = urllib.parse.urlparse(final_url)
+def rule_checks(url: str) -> tuple[int, list[str]]:
+    """Offline expert rules on one URL (no network). Returns (points, reasons)."""
+    score, reasons = 0, []
+    domain = extract_domain(url)
+    parsed = urllib.parse.urlparse(url)
     full_path = (parsed.path + "?" + parsed.query).lower()
 
-    # ── Domain age check (STUB) ───────────────────────────────────────────────
-    age_days = stub_domain_age_days(domain)   # STUB
-    if age_days < 7:
-        score += 35
-        reasons.append(f"[STUB] Domain '{domain}' appears to be only {age_days} day(s) old — very new domains are a red flag.")
-    elif age_days < 30:
-        score += 20
-        reasons.append(f"[STUB] Domain '{domain}' registered ~{age_days} days ago — recently registered domains are suspicious.")
-    elif age_days < 90:
-        score += 10
-        reasons.append(f"[STUB] Domain '{domain}' is ~{age_days} days old — moderately new.")
+    # Look-alike payment brand
+    domain_base = domain.split(".")[0] if domain else ""
+    if domain not in SHORTENERS:
+        for brand in PAYMENT_BRANDS:
+            dist = levenshtein(domain_base, brand)
+            if 0 < dist <= 2 and abs(len(domain_base) - len(brand)) <= 2 and len(domain_base) >= 4:
+                score += 30
+                reasons.append(
+                    f"Domain '{domain}' closely resembles payment brand '{brand}' "
+                    f"(edit distance {dist}) — possible fake site."
+                )
+                break
+            if brand in domain_base and domain_base != brand:
+                score += 20
+                reasons.append(f"Domain '{domain}' contains the payment brand name '{brand}' — common in scam links.")
+                break
 
-    # ── Look-alike domain check ───────────────────────────────────────────────
-    domain_base = re.split(r"\.", domain)[0]
-    # Exclude known shortener domains from lookalike detection
-    _shortener_domains = {
-        "bit", "tinyurl", "goo", "ow", "rb", "buff", "is",
-        "tiny", "cutt", "shorturl", "snip", "qr", "shorte",
-    }
-    _skip_lookalike = domain_base in _shortener_domains
-    for brand in PAYMENT_BRANDS:
-        dist = levenshtein(domain_base, brand)
-        # Same length ±2 and distance ≤2 but not identical = look-alike
-        if 0 < dist <= 2 and abs(len(domain_base) - len(brand)) <= 2 and not _skip_lookalike:
-            score += 30
-            reasons.append(
-                f"Domain '{domain}' closely resembles known payment brand '{brand}' "
-                f"(edit distance {dist}) — possible phishing domain."
-            )
-            break
-        # Brand name appears as a substring of a longer domain (e.g. paytm-refund.com)
-        if brand in domain_base and domain_base != brand:
-            score += 20
-            reasons.append(
-                f"Domain '{domain}' contains payment brand name '{brand}' — "
-                "commonly used in phishing links."
-            )
-            break
+    found = [kw for kw in SUSPICIOUS_KEYWORDS if kw in full_path]
+    if found:
+        score += min(10 * len(found), 25)
+        reasons.append(f"Scam keyword(s) in the link: {', '.join(found)}.")
 
-    # ── Suspicious keyword scan ───────────────────────────────────────────────
-    found_keywords = [kw for kw in SUSPICIOUS_KEYWORDS if kw in full_path]
-    if found_keywords:
-        score += min(10 * len(found_keywords), 25)
-        reasons.append(
-            f"Suspicious keyword(s) in URL: {', '.join(found_keywords)}."
-        )
-
-    # ── HTTP vs HTTPS ─────────────────────────────────────────────────────────
-    if final_url.startswith("http://"):
+    if url.startswith("http://"):
         score += 10
         reasons.append("Link uses unencrypted HTTP — your data is not protected.")
 
-    # ── Threat feed check (STUB) ──────────────────────────────────────────────
-    on_feed = stub_threat_feed(final_url)   # STUB
-    if on_feed:
-        score += 40
-        reasons.append("[STUB] URL found on threat feed (VirusTotal / PhishTank).")
-
-    # ── IP address instead of domain ─────────────────────────────────────────
     if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", domain):
         score += 20
-        reasons.append("Link goes directly to an IP address — legitimate payment sites don't do this.")
+        reasons.append("Link goes directly to an IP address — real payment sites don't do this.")
 
-    # ── Excessive subdomains ──────────────────────────────────────────────────
-    parts = domain.split(".")
-    if len(parts) > 4:
+    if len(domain.split(".")) > 4:
         score += 10
-        reasons.append(f"Unusually many subdomains in '{domain}' — a common obfuscation trick.")
+        reasons.append(f"Unusually many subdomains in '{domain}' — a common disguise trick.")
 
-    if not reasons:
-        reasons.append("No obvious red flags detected.")
-
-    return _build_result(score, reasons, redirect_chain, final_url, landing_check)
+    return score, reasons
 
 
-def _build_result(score: int, reasons: list[str], chain: list[str], final_url: str, landing_check: dict) -> dict:
-    score = max(0, min(100, score))
+def ml_check(url: str) -> dict:
+    """Run the trained model on one URL."""
+    if MODEL is None:
+        return {"available": False, "error": MODEL_ERROR}
+    prob = float(MODEL.predict_proba([url])[0])
+    return {
+        "available": True,
+        "probability": round(prob, 4),
+        "score": round(prob * 100),
+        "reasons": MODEL.explain(url) if prob >= 0.31 else [],
+        "model_version": MODEL.version,
+    }
+
+
+def verdict_for(score: int) -> tuple[str, str]:
     if score <= 30:
-        verdict = "Safe"
-        verdict_detail = "This link looks legitimate based on our checks."
-    elif score <= 70:
-        verdict = "Suspicious"
-        verdict_detail = "Proceed with caution — some red flags were detected."
-    else:
-        verdict = "Dangerous"
-        verdict_detail = "Do NOT proceed — high probability of phishing or scam."
+        return "Safe", "This link looks legitimate based on our checks."
+    if score <= 70:
+        return "Suspicious", "Proceed with caution — some red flags were detected."
+    return "Dangerous", "Do NOT proceed — high probability of phishing or scam."
 
+
+async def analyze(raw: str) -> dict:
+    """Core analysis: accepts a URL, a UPI string, or any text decoded from a QR code."""
+    reasons: list[str] = []
+    rule_score = 0
+    notes: list[str] = []
+    redirect_chain: list[str] = [raw]
+    landing_check = {"has_creds": False, "screenshot_b64": None, "error": None}
+    ml = {"available": False}
+
+    # ── UPI path ─────────────────────────────────────────────────────────────
+    upi_params = parse_upi(raw)
+    if upi_params is not None:
+        vpa = upi_params.get("pa", "")
+        amount_str = upi_params.get("am", "")
+        if not vpa:
+            rule_score += 25
+            reasons.append("UPI link has no payee address (pa=…) — not a valid payment request.")
+        elif not re.match(r"^[\w.\-]+@[\w]+$", vpa):
+            rule_score += 25
+            reasons.append(f"UPI ID '{vpa}' has an unusual format — may be fake.")
+        try:
+            amount = float(amount_str)
+            if amount > 10_000:
+                rule_score += 20
+                reasons.append(f"UPI request is for ₹{amount:,.0f} — unusually high amount.")
+            elif amount > 0:
+                reasons.append(f"UPI amount requested: ₹{amount:,.0f}. Scanning a QR to *receive* money is a common scam — you never need to pay or enter a PIN to receive.")
+        except (ValueError, TypeError):
+            pass
+        for kw in SUSPICIOUS_KEYWORDS:
+            if kw in vpa.lower() or kw in upi_params.get("pn", "").lower():
+                rule_score += 15
+                reasons.append(f"UPI payee contains the scam keyword '{kw}'.")
+                break
+        notes.append("The ML model checks web links; UPI requests are checked with rules only.")
+        upi = {"payee": vpa, "name": upi_params.get("pn"), "amount": amount_str or None,
+               "currency": upi_params.get("cu", "INR"), "note": upi_params.get("tn")}
+        return _build_result(rule_score, rule_score, ml, reasons, redirect_chain, raw, landing_check, notes, upi)
+
+    # ── URL path ─────────────────────────────────────────────────────────────
+    url = ensure_scheme(raw)
+    if url is None:
+        reasons.append("Input doesn't look like a web link or UPI string.")
+        return _build_result(10, 10, ml, reasons, redirect_chain, raw, landing_check, notes)
+
+    final_url = url
+    if is_shortened_url(url):
+        redirect_chain = follow_redirects(url)
+        last_hop = redirect_chain[-1]
+        if last_hop.startswith("<"):
+            final_url = redirect_chain[-2] if len(redirect_chain) > 1 else url
+            rule_score += 15
+            reasons.append(f"Short link could not be opened ({last_hop.strip('<>')}), so its real destination is hidden.")
+        else:
+            final_url = last_hop
+            reasons.append(f"Short link detected — it leads to {final_url} after {len(redirect_chain) - 1} hop(s).")
+        hops = len(redirect_chain) - 1
+        if hops >= 3:
+            rule_score += 20
+            reasons.append(f"Long redirect chain ({hops} hops) — often used to hide the destination.")
+        elif hops == 2:
+            rule_score += 10
+            reasons.append("Two redirect hops found.")
+
+    # Trained ML model on the final destination
+    ml = ml_check(final_url)
+    if ml.get("available"):
+        reasons.extend(ml["reasons"])
+
+    # Expert rules
+    pts, why = rule_checks(final_url)
+    rule_score += pts
+    reasons.extend(why)
+
+    # Optional: page check with a headless browser
+    landing_check = await run_landing_page_check(final_url)
+    if landing_check["has_creds"]:
+        rule_score += 40
+        reasons.append("The page asks for a UPI PIN, OTP or password — high risk of stealing your details.")
+    elif landing_check["error"]:
+        first_line = str(landing_check["error"]).splitlines()[0][:160]
+        notes.append(f"Page check skipped: {first_line}.")
+
+    # Optional: threat feed
+    on_feed = check_threat_feed(final_url)
+    if on_feed:
+        rule_score += 60
+        reasons.append("Google Safe Browsing lists this link as dangerous.")
+    elif on_feed is None:
+        notes.append("Threat-feed lookup is off (set GOOGLE_SAFE_BROWSING_API_KEY to enable it).")
+
+    ml_score = ml.get("score", 0) if ml.get("available") else 0
+    final = max(ml_score, rule_score)
+    if not reasons:
+        reasons.append("No red flags found by the model or the rules.")
+    return _build_result(final, rule_score, ml, reasons, redirect_chain, final_url, landing_check, notes)
+
+
+def _build_result(score, rule_score, ml, reasons, chain, final_url, landing_check, notes, upi=None) -> dict:
+    score = int(max(0, min(100, score)))
+    verdict, detail = verdict_for(score)
+    if not ml.get("available") and ml.get("error"):
+        notes.append("ML model not loaded — using rules only.")
     return {
         "score": score,
         "verdict": verdict,
-        "verdict_detail": verdict_detail,
+        "verdict_detail": detail,
+        "ml": ml,
+        "rule_score": int(max(0, min(100, rule_score))),
         "reasons": reasons,
         "redirect_chain": chain,
         "final_url": final_url,
+        "target": final_url,
+        "upi": upi,
         "landing_page_check": landing_check,
-        "stubs_active": [
-            "domain_age (replace with WHOIS/SecurityTrails API)",
-            "threat_feed (replace with VirusTotal/Google Safe Browsing API)",
-        ],
+        "notes": notes,
     }
-
 
 
 # ---------------------------------------------------------------------------
@@ -431,55 +449,80 @@ def _build_result(score: int, reasons: list[str], chain: list[str], final_url: s
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "model_loaded": MODEL is not None, "playwright": HAS_PLAYWRIGHT, "pyzbar": HAS_PYZBAR}
+
+
+@app.get("/model/info")
+def model_info():
+    """Validation metrics of the loaded model (from the training notebook)."""
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail=f"Model not loaded: {MODEL_ERROR}")
+    return {"version": MODEL.version, "metrics": MODEL.metrics,
+            "best_params": MODEL.bundle.get("best_params"), "trained_with_sklearn": MODEL.bundle.get("sklearn_version")}
 
 
 @app.post("/analyze/link")
-async def analyze_link(payload: dict):
-    """Analyze a URL or UPI string submitted as JSON."""
-    raw = payload.get("input") or payload.get("link") or ""
-    raw = raw.strip()
+async def analyze_link(request: Request):
+    """Analyze a URL or UPI string. Body: JSON {"input": "..."} (form field 'input'/'url' also accepted)."""
+    if request.headers.get("content-type", "").startswith("application/json"):
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body is not valid JSON.")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail='Send a JSON object like {"input": "<link>"}.')
+    else:
+        body = dict(await request.form())
+    raw = str(body.get("input") or body.get("link") or body.get("url") or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="No input provided.")
-    result = await analyze(raw)
-    return result
+    if len(raw) > MAX_INPUT_LEN:
+        raise HTTPException(status_code=413, detail=f"Input is longer than {MAX_INPUT_LEN} characters.")
+    return await analyze(LinkRequest(input=raw).input)
+
+
+@app.post("/analyze/batch")
+def analyze_batch(payload: BatchRequest):
+    """Fast offline check of up to 1000 links at once (ML model + rules, no network calls)."""
+    urls = [u.strip() for u in payload.urls]
+    if any(len(u) > MAX_INPUT_LEN for u in urls):
+        raise HTTPException(status_code=413, detail=f"Each URL must be at most {MAX_INPUT_LEN} characters.")
+    probs = MODEL.predict_proba(urls) if MODEL is not None else np.zeros(len(urls))
+    out = []
+    for u, p in zip(urls, probs):
+        full = ensure_scheme(u) or u
+        rule_score, _ = rule_checks(full)
+        ml_score = round(float(p) * 100) if MODEL is not None else 0
+        score = int(min(100, max(ml_score, rule_score)))
+        out.append({"url": u, "score": score, "verdict": verdict_for(score)[0],
+                    "ml_probability": round(float(p), 4) if MODEL is not None else None, "rule_score": min(rule_score, 100)})
+    return {"count": len(out), "model_loaded": MODEL is not None, "results": out}
 
 
 @app.post("/analyze/qr")
 async def analyze_qr(file: UploadFile = File(...)):
-    """
-    Accept an uploaded QR code image, decode it with OpenCV + pyzbar,
-    then run the same analysis pipeline.
-    """
-    if not file.content_type.startswith("image/"):
+    """Decode an uploaded QR code image, then run the same analysis."""
+    if not (file.content_type or "").startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image.")
-
     contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if len(contents) > MAX_QR_BYTES:
+        raise HTTPException(status_code=413, detail="Image is larger than 5 MB.")
 
+    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode image — is it a valid image file?")
+        raise HTTPException(status_code=400, detail="Could not read the image — is it a valid image file?")
 
-    # Try pyzbar first (faster, more reliable for clean QR codes)
-    decoded = None
+    raw = None
     if HAS_PYZBAR:
         decoded = pyzbar.decode(img)
+        if decoded:
+            raw = decoded[0].data.decode("utf-8", errors="replace").strip()
+    if not raw:
+        data, _, _ = cv2.QRCodeDetector().detectAndDecode(img)
+        raw = (data or "").strip()
+    if not raw:
+        raise HTTPException(status_code=422, detail="No QR code found in the image. Make sure it is clear and well-lit.")
 
-    # If pyzbar fails, try OpenCV's built-in QR detector as fallback
-    if not decoded:
-        detector = cv2.QRCodeDetector()
-        data, _, _ = detector.detectAndDecode(img)
-        if data:
-            raw = data.strip()
-        else:
-            raise HTTPException(
-                status_code=422,
-                detail="No QR code found in the image. Make sure the image is clear and well-lit.",
-            )
-    else:
-        raw = decoded[0].data.decode("utf-8", errors="replace").strip()
-
-    result = await analyze(raw)
-    result["decoded_text"] = raw  # Surface what was inside the QR
+    result = await analyze(raw[:MAX_INPUT_LEN])
+    result["decoded_text"] = raw
     return result

@@ -1,0 +1,22 @@
+{
+  "test_f1": 0.9207660856466537,
+  "test_auc": 0.9940313633524569,
+  "test_precision": 0.9478114478114478,
+  "test_recall": 0.8952213574357687,
+  "cv_f1_mean": 0.910594083609132,
+  "cv_f1_std": 0.004602500590354126,
+  "cross_dataset_f1_A_to_B": 0.7691359926074234,
+  "live_recall_at_31": 0.6802,
+  "popular_sites_false_alarm_at_31": 0.009747967069043892,
+  "live_recall_at_50": 0.6099666666666667,
+  "n_train": 469723,
+  "n_test": 117431,
+  "best_params": {
+    "gradient_boosting": {
+      "learning_rate": 0.1,
+      "max_leaf_nodes": 63,
+      "min_samples_leaf": 20
+    },
+    "text_C": 20
+  }
+}

@@ -6,3 +6,8 @@ __pycache__/
 .env.local
 .manus-logs/
 *.log
+
+# training data is downloaded by the notebook
+ml/data/
+.venv/
+.pytest_cache/
